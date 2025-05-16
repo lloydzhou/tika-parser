@@ -37,5 +37,4 @@ ADD ./text_splitter.py /text_splitter.py
 
 EXPOSE 9998 8888
 
-ENTRYPOINT [ "/bin/sh", "-c", "exec java -jar /tika-server-standard-${TIKA_VERSION}.jar -h 0.0.0.0 $0 $@ & python3 /main.py"]
-
+ENTRYPOINT [ "/bin/sh", "-c", "exec java -cp \"/tika-server-standard-${TIKA_VERSION}.jar:/tika-extras/*\" org.apache.tika.server.core.TikaServerCli -h 0.0.0.0 $0 $@ & python3 /main.py"]
