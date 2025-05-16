@@ -33,6 +33,7 @@ RUN set -eux \
     && pip3 install regex tika tornado --break-system-packages
 
 ADD ./main.py /main.py
+ADD ./text_splitter.py /text_splitter.py
 
 EXPOSE 9998 8888
 
