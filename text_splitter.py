@@ -109,6 +109,47 @@ class TextSplitter(object):
             })
             offset += length
             index += 1
+
+        # Post-process: merge small chunks to optimize chunk size
+        if result:
+            # Configuration for chunk merging
+            min_chunk_size = getattr(self, 'MIN_CHUNK_SIZE', 100)
+            target_chunk_size = getattr(self, 'TARGET_CHUNK_SIZE', 500)
+
+            # Calculate average chunk size
+            total_content_size = sum(len(chunk['page_content']) for chunk in result)
+            avg_chunk_size = total_content_size / len(result) if result else 0
+
+            # Determine if we need more aggressive merging based on average size
+            aggressive_merge = avg_chunk_size < min_chunk_size
+
+            # Merge small chunks
+            merged_result = []
+            current_chunk = None
+
+            for chunk in result:
+                if current_chunk is None:
+                    current_chunk = chunk
+                elif (len(current_chunk['page_content']) < target_chunk_size and 
+                    (len(chunk['page_content']) < min_chunk_size or aggressive_merge)):
+                    # Merge with previous chunk
+                    current_chunk['page_content'] += chunk['page_content']
+                    current_chunk['metadata']['length'] += chunk['metadata']['length']
+                    current_chunk['metadata']['strip'] = len(current_chunk['page_content'].strip())
+                else:
+                    # Add completed chunk to results and start new one
+                    merged_result.append(current_chunk)
+                    current_chunk = chunk
+
+            # Add the last chunk if it exists
+            if current_chunk:
+                merged_result.append(current_chunk)
+
+            # Update indices
+            for i, chunk in enumerate(merged_result):
+                chunk['metadata']['index'] = i
+
+            result = merged_result
         return result
 
 default_splitter = TextSplitter()
