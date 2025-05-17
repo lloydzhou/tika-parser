@@ -23,6 +23,8 @@ class ParserHandler(tornado.web.RequestHandler):
         )
         assert 'content' in parsed and parsed['content'], 'parsed error'
         result = splitter(parsed['content'])
+        for chunk in result:
+            chunk['metadata']['filename'] = filename            
         self.finish(json.dumps(result, ensure_ascii=False))
 
 
