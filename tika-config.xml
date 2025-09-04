@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<properties>
+  <parsers>
+    <!-- Use the default parser list, but override specific parser configs below -->
+    <parser class="org.apache.tika.parser.DefaultParser"/>
+
+    <!-- Configuration for classic Microsoft Office files (.doc, .xls, .ppt) -->
+    <parser class="org.apache.tika.parser.microsoft.OfficeParser">
+      <params>
+        <param name="includeHeadersAndFooters" type="bool">false</param>
+      </params>
+    </parser>
+
+    <!-- Configuration for OOXML files (.docx, .xlsx, .pptx) -->
+    <parser class="org.apache.tika.parser.microsoft.ooxml.OOXMLParser">
+      <params>
+        <param name="includeHeadersAndFooters" type="bool">false</param>
+      </params>
+    </parser>
+
+    <!-- Configuration for PDF files -->
+    <parser class="org.apache.tika.parser.pdf.PDFParser">
+      <params>
+        <!-- Attempt to disable header/footer extraction -->
+        <param name="extractHeaderAndFooters" type="bool">false</param>
+        <!-- Suppress text that appears to be duplicated across pages (very effective for headers/footers) -->
+        <param name="suppressDuplicateOverlappingText" type="bool">true</param>
+        <!-- Sort text by position to improve layout preservation -->
+        <param name="sortByPosition" type="bool">true</param>
+        <!-- Extract inline images -->
+        <param name="extractInlineImages" type="bool">true</param>
+      </params>
+    </parser>
+  </parsers>
+</properties>
