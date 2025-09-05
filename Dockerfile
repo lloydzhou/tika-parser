@@ -24,10 +24,6 @@ RUN apt-get update && apt-get install -y \
     && curl -fSL ${TIKA_SERVER_URL} -o tika-server-standard-${TIKA_VERSION}.jar \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the Tika server JAR and the custom config
-# COPY tika-server-standard-2.6.0.jar .
-COPY tika-config.xml .
-
 # Copy the application's requirements file and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -35,6 +31,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application code and the entrypoint script
 COPY main.py .
 COPY entrypoint.sh .
+
+# Copy the Tika server JAR and the custom config
+# COPY tika-server-standard-2.6.0.jar .
+COPY tika-config.xml .
 
 # Make the entrypoint script executable
 RUN chmod +x entrypoint.sh

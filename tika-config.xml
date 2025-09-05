@@ -8,6 +8,8 @@
     <parser class="org.apache.tika.parser.microsoft.OfficeParser">
       <params>
         <param name="includeHeadersAndFooters" type="bool">false</param>
+        <!-- Do not extract content from shapes (e.g., text boxes, formulas) -->
+        <param name="includeShapeBasedContent" type="bool">false</param>
       </params>
     </parser>
 
@@ -15,6 +17,8 @@
     <parser class="org.apache.tika.parser.microsoft.ooxml.OOXMLParser">
       <params>
         <param name="includeHeadersAndFooters" type="bool">false</param>
+        <!-- Do not extract content from shapes (e.g., text boxes, formulas) -->
+        <param name="includeShapeBasedContent" type="bool">false</param>
       </params>
     </parser>
 
@@ -25,8 +29,9 @@
         <param name="extractHeaderAndFooters" type="bool">false</param>
         <!-- Suppress text that appears to be duplicated across pages (very effective for headers/footers) -->
         <param name="suppressDuplicateOverlappingText" type="bool">true</param>
-        <!-- Sort text by position to improve layout preservation -->
-        <param name="sortByPosition" type="bool">true</param>
+        <!-- Sort text by position to improve layout preservation. Default is false. -->
+        <!-- Sometimes, setting this to false can help header/footer removal. -->
+        <param name="sortByPosition" type="bool">false</param>
         <!-- Extract inline images -->
         <param name="extractInlineImages" type="bool">true</param>
       </params>

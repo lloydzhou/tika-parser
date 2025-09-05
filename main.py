@@ -7,7 +7,8 @@ import base64
 import imghdr
 import logging
 import asyncio
-from typing import Counter, Optional, Dict
+import json
+from typing import Counter, Optional, Dict, List
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -47,23 +48,6 @@ def sanitize_html(html: str) -> str:
         return html
 
 
-async def fetch_html(client: httpx.AsyncClient, body: bytes, timeout: int = 60) -> str:
-    """
-    Fetch HTML from Tika and return the decoded resp.text (httpx handles charset).
-    We still sanitize the returned HTML to remove problematic NUL refs/control chars.
-    """
-    url = TIKA_SERVER.rstrip("/") + "/tika"
-    headers = {
-        "Accept": "text/html",
-        "X-Tika-PDFExtractInlineImages": "true",
-    }
-    resp = await client.put(url, content=body, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    text = resp.text
-    text = sanitize_html(text)
-    return text
-
-
 async def fetch_attachments_zip(client: httpx.AsyncClient, body: bytes, timeout: int = 60) -> Optional[bytes]:
     """
     Only request the single /unpack/all endpoint (current tika version).
@@ -71,9 +55,7 @@ async def fetch_attachments_zip(client: httpx.AsyncClient, body: bytes, timeout:
     """
     try:
         url = TIKA_SERVER.rstrip("/") + UNPACK_PATH
-        resp = await client.put(url, content=body, timeout=timeout, headers={
-            "X-Tika-PDFExtractInlineImages": "true",
-        })
+        resp = await client.put(url, content=body, timeout=timeout)
         if resp.status_code == 200 and resp.content:
             try:
                 with zipfile.ZipFile(io.BytesIO(resp.content)) as _:
@@ -84,6 +66,53 @@ async def fetch_attachments_zip(client: httpx.AsyncClient, body: bytes, timeout:
     except httpx.RequestError:
         logger.debug("request to unpack endpoint failed", exc_info=True)
     return None
+
+
+async def fetch_rmeta(client: httpx.AsyncClient, body: bytes, timeout: int = 60):
+    """
+    Fetch structured metadata records from Tika's /rmeta endpoint.
+    Returns (main_content_html, embedded_records_list).
+    - main_content_html: the X-TIKA:content from the first record (if present), sanitized
+    - embedded_records_list: any remaining parsed records (attachments/embedded resources metadata)
+    """
+    url = TIKA_SERVER.rstrip("/") + "/rmeta"
+    headers = {
+        "Accept": "application/json",
+    }
+
+    resp = await client.put(url, content=body, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    text = resp.text
+
+    records = []
+    try:
+        parsed = resp.json()
+        if isinstance(parsed, list):
+            records = parsed
+        elif isinstance(parsed, dict):
+            records = [parsed]
+    except Exception:
+        # fallback: try parse as ndjson (one json object per line)
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                records.append(obj)
+            except Exception:
+                # skip non-json lines
+                continue
+
+    main_content = ""
+    embedded = []
+    if records:
+        # take first record as main document output
+        main_content = records[0].get("X-TIKA:content", "") or ""
+        embedded = records[1:]
+
+    main_content = sanitize_html(main_content)
+    return main_content, embedded
 
 
 def extract_zip_files(zip_bytes: bytes) -> Dict[str, bytes]:
@@ -524,6 +553,73 @@ def normalize_tables_use_first_row_as_header(html: str) -> str:
         return html
 
 
+def remove_page_header_footer_repeats(html: str, min_repeat: int = 3, max_header_text_len: int = 200) -> str:
+    """
+    Detect repeated short blocks at the start or end of per-page containers (e.g. <div class="page">)
+    and remove them when they occur on at least `min_repeat` pages.
+
+    This helps remove headers/footers that Tika emits inside each page block.
+    """
+    if not html:
+        return html
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        # find page containers (class contains 'page')
+        pages = [p for p in soup.find_all(True, class_=lambda c: c and 'page' in str(c).lower())]
+        if not pages:
+            # fallback: if no page divs, nothing to do
+            return html
+
+        first_texts = []
+        last_texts = []
+        page_tags = []
+        for p in pages:
+            # collect candidate first/last meaningful tag text in this page
+            tags = [t for t in p.find_all(['p','div','h1','h2','h3','h4','h5','h6','span'], recursive=True)]
+            first_txt = ""
+            last_txt = ""
+            for t in tags:
+                ttxt = _normalize_text(t.get_text(" ", strip=True))
+                if ttxt and len(ttxt) <= max_header_text_len:
+                    first_txt = ttxt
+                    break
+            for t in reversed(tags):
+                ttxt = _normalize_text(t.get_text(" ", strip=True))
+                if ttxt and len(ttxt) <= max_header_text_len:
+                    last_txt = ttxt
+                    break
+            first_texts.append(first_txt)
+            last_texts.append(last_txt)
+            page_tags.append((p, tags))
+
+        from collections import Counter as _Counter
+        fcounts = _Counter([t for t in first_texts if t])
+        lcounts = _Counter([t for t in last_texts if t])
+
+        f_repeated = {t for t, cnt in fcounts.items() if cnt >= min_repeat}
+        l_repeated = {t for t, cnt in lcounts.items() if cnt >= min_repeat}
+
+        if not f_repeated and not l_repeated:
+            return html
+
+        # remove matching tags within each page
+        for p, tags in page_tags:
+            for tag in tags:
+                try:
+                    ttxt = _normalize_text(tag.get_text(" ", strip=True))
+                except Exception:
+                    continue
+                if ttxt in f_repeated or ttxt in l_repeated:
+                    try:
+                        tag.decompose()
+                    except Exception:
+                        pass
+        logger.warn("removed repeated page headers/footers: headers=%s footers=%s", list(f_repeated), list(l_repeated))
+        return str(soup)
+    except Exception:
+        return html
+
+
 @app.post("/", response_class=PlainTextResponse)
 async def parse_file(file: UploadFile = File(...)):
     """
@@ -538,11 +634,22 @@ async def parse_file(file: UploadFile = File(...)):
 
     async with httpx.AsyncClient() as client:
         try:
-            # fetch HTML from Tika (decoded by httpx, then sanitized)
-            html = await fetch_html(client, body)
+            # Use /rmeta to obtain the main document content and embedded records.
+            # This avoids the problem where /tika's HTML may include text extracted from embedded
+            # resources (e.g., WMF formulas) appended into the main content.
+            html, embedded_records = await fetch_rmeta(client, body)
         except Exception as e:
-            logger.exception("failed to fetch HTML from Tika")
-            raise HTTPException(status_code=502, detail=f"tika /tika error: {e}")
+            logger.exception("failed to fetch rmeta from Tika")
+            raise HTTPException(status_code=502, detail=f"tika /rmeta error: {e}")
+
+        # Build a simple map of embedded resource basenames -> metadata from rmeta records
+        embedded_meta = {}
+        for rec in (embedded_records if 'embedded_records' in locals() and embedded_records else []):
+            # resourceName is common; fallback to embedded path if present
+            rname = rec.get('resourceName') or rec.get('X-TIKA:embedded_resource_path') or rec.get('X-TIKA:embedded_resource_name')
+            if rname:
+                b = os.path.basename(rname).lower()
+                embedded_meta[b] = rec
 
         # check if HTML contains any <img> tags; only then fetch attachments
         soup_check = BeautifulSoup(html or "", "html.parser")
@@ -568,6 +675,9 @@ async def parse_file(file: UploadFile = File(...)):
             html_inlined = await asyncio.to_thread(remove_non_content_blocks, html_inlined, attachments)
         else:
             html_inlined = await asyncio.to_thread(remove_non_content_blocks, html_inlined, None)
+
+        # remove repeated per-page headers/footers emitted by Tika (e.g. <div class="page"> chunks)
+        html_inlined = await asyncio.to_thread(remove_page_header_footer_repeats, html_inlined)
 
         # normalize tables: use first row as header if no <th> exists
         html_inlined = await asyncio.to_thread(normalize_tables_use_first_row_as_header, html_inlined)
