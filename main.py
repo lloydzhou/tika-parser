@@ -643,13 +643,21 @@ async def parse_file(file: UploadFile = File(...)):
             raise HTTPException(status_code=502, detail=f"tika /rmeta error: {e}")
 
         # Build a simple map of embedded resource basenames -> metadata from rmeta records
-        embedded_meta = {}
-        for rec in (embedded_records if 'embedded_records' in locals() and embedded_records else []):
-            # resourceName is common; fallback to embedded path if present
-            rname = rec.get('resourceName') or rec.get('X-TIKA:embedded_resource_path') or rec.get('X-TIKA:embedded_resource_name')
-            if rname:
-                b = os.path.basename(rname).lower()
-                embedded_meta[b] = rec
+        # embedded_meta = {}
+        # for rec in (embedded_records if 'embedded_records' in locals() and embedded_records else []):
+        #     # resourceName is common; fallback to embedded path if present
+        #     rname = rec.get('resourceName') or rec.get('X-TIKA:embedded_resource_path') or rec.get('X-TIKA:embedded_resource_name')
+        #     if rname:
+        #         b = os.path.basename(rname).lower()
+        #         embedded_meta[b] = rec
+
+        logger.info("fetched rmeta: main content length=%d, embedded records=%d", len(html) if html else 0, len(embedded_meta))
+
+        # remove repeated per-page headers/footers emitted by Tika (e.g. <div class="page"> chunks)
+        html_inlined = await asyncio.to_thread(remove_page_header_footer_repeats, html_inlined)
+
+        # normalize tables: use first row as header if no <th> exists
+        html_inlined = await asyncio.to_thread(normalize_tables_use_first_row_as_header, html_inlined)
 
         # check if HTML contains any <img> tags; only then fetch attachments
         soup_check = BeautifulSoup(html or "", "html.parser")
@@ -675,12 +683,6 @@ async def parse_file(file: UploadFile = File(...)):
             html_inlined = await asyncio.to_thread(remove_non_content_blocks, html_inlined, attachments)
         else:
             html_inlined = await asyncio.to_thread(remove_non_content_blocks, html_inlined, None)
-
-        # remove repeated per-page headers/footers emitted by Tika (e.g. <div class="page"> chunks)
-        html_inlined = await asyncio.to_thread(remove_page_header_footer_repeats, html_inlined)
-
-        # normalize tables: use first row as header if no <th> exists
-        html_inlined = await asyncio.to_thread(normalize_tables_use_first_row_as_header, html_inlined)
 
         # convert HTML -> Markdown
         # set autolinks=False so markdownify will emit explicit [url](url) instead of <url>

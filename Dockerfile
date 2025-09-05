@@ -5,7 +5,7 @@ RUN sed -i "s@http://deb.debian.org@http://mirrors.aliyun.com@g" /etc/apt/source
 
 RUN ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
-ARG PORT=8000
+ARG PORT=8888
 ARG TIKA_VERSION=3.2.2
 ARG JRE='openjdk-17-jre-headless'
 # Prefer Aliyun mirror for faster downloads in regions where it's closer than the Apache archive
