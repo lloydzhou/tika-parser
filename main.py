@@ -98,13 +98,24 @@ async def fetch_rmeta(client: httpx.AsyncClient, body: bytes, timeout: int = 60)
                 continue
 
     main_content = ""
+    page_size = 0
     embedded = []
     if records:
         # take first record as main document output
         main_content = records[0].get("X-TIKA:content", "") or ""
+        page_size_str = (
+            records[0].get("xmpTPg:NPages")
+            or records[0].get("Page-Count")
+            or records[0].get("meta:page-count")
+            or "0"
+        )
+        try:
+            page_size = int(page_size_str)
+        except (ValueError, TypeError):
+            page_size = 0
         embedded = records[1:]
 
-    return main_content, embedded
+    return main_content, page_size, embedded
 
 
 def _extract_sentence_fragment(text: str, which: str = "last", max_len: int = 200) -> str:
@@ -640,7 +651,7 @@ async def parse_file(file: UploadFile = File(...)):
     async with httpx.AsyncClient() as client:
         try:
             # Use /rmeta to obtain the main document content and embedded records.
-            html, embedded_records = await fetch_rmeta(client, body)
+            html, page_size, embedded_records = await fetch_rmeta(client, body)
         except Exception as e:
             logger.exception("failed to fetch rmeta from Tika")
             raise HTTPException(status_code=502, detail=f"tika /rmeta error: {e}")
@@ -652,7 +663,8 @@ async def parse_file(file: UploadFile = File(...)):
         tree = sanitize_html(html)
 
         # remove repeated per-page headers/footers emitted by Tika (e.g. <div class="page"> chunks)
-        tree = await asyncio.to_thread(remove_page_header_footer_repeats, tree)
+        min_repeat = max(3, page_size // 2) if page_size and page_size > 0 else 3
+        tree = await asyncio.to_thread(remove_page_header_footer_repeats, tree, min_repeat=min_repeat)
 
         logger.debug("After remove_page_header_footer_repeats: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
         logger.debug("Processing remove_page_header_footer_repeats took %.3f seconds", asyncio.get_event_loop().time() - start_time)
