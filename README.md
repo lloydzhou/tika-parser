@@ -22,9 +22,9 @@ curl -sS -X POST "http://127.0.0.1:8888/" -F "file=@/path/to/your/document.pdf" 
 
 响应
 - 成功时返回纯 Markdown 文本，HTTP 状态 200。图片会以 data URI 的形式内联，例如：
-
+```
   ![alt text](data:image/png;base64,iVBORw0KGgoAAAANS...)
-
+```
 - 错误时返回相应的 HTTP 错误码与简短描述（例如 400 空文件，502 Tika 服务错误等）。
 
 本地开发
