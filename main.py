@@ -31,16 +31,17 @@ def _ensure_etree(html_or_etree):
     if isinstance(html_or_etree, etree._Element):
         return html_or_etree
     html = html_or_etree or ""
+    parser = etree.HTMLParser(recover=True, huge_tree=True)
     try:
-        # Parse with lxml html parser, which is more forgiving than xml parser
-        return lxml_html.fromstring(html)
+        # Use forgiving parser that allows huge trees and recovers from malformation
+        return lxml_html.fromstring(html, parser=parser)
     except Exception:
         # Fallback for malformed HTML
         try:
-            return lxml_html.fragment_fromstring(html)
+            return lxml_html.fragment_fromstring(html, parser=parser)
         except Exception:
             # Last resort: create empty document
-            return lxml_html.fromstring("<html><body></body></html>")
+            return lxml_html.fromstring("<html><body></body></html>", parser=parser)
 
 
 def sanitize_html(html: str) -> etree._Element:
@@ -57,16 +58,7 @@ def sanitize_html(html: str) -> etree._Element:
     # Remove control characters except \t (09), \n (0A), \r (0D)
     html = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', html)
 
-    # Parse with lxml and remove all <title> tags
-    try:
-        tree = lxml_html.fromstring(html)
-        # Remove title elements
-        for title in tree.xpath(".//title"):
-            title.getparent().remove(title)
-        return tree
-    except Exception:
-        # If parsing fails, return minimal document
-        return lxml_html.fromstring("<html><body></body></html>")
+    return _ensure_etree(html)
 
 
 async def fetch_rmeta(client: httpx.AsyncClient, body: bytes, timeout: int = 60):
@@ -145,7 +137,8 @@ def _get_text_content(element):
     """Get text content from an lxml element, similar to BeautifulSoup's get_text()"""
     if element is None:
         return ""
-    return (element.text_content() or "").strip()
+    return "".join(element.itertext()).strip() or ""
+    # return (element.text_content() or "").strip()
 
 
 def _gather_text_from_previous(img_tag, max_ancestors: int = 4) -> str:
@@ -227,7 +220,7 @@ def inline_images_in_html(tree):
     
     # Find all img elements using xpath
     imgs = tree.xpath(".//img")
-    
+
     for img in imgs:
         alt_text = _build_title_from_context(img)
         if alt_text:
@@ -360,12 +353,14 @@ def remove_non_content_blocks(tree, min_header_repeat: int = 3, min_package_grou
                             try:
                                 parent = tag.getparent()
                                 if parent is not None:
+                                    logger.warning("Removing repeated header/footer element: %s %r", txt, tag)
                                     parent.remove(tag)
                             except Exception:
                                 pass
 
         return tree
-    except Exception:
+    except Exception as e:
+        logger.error(e)
         return tree
 
 
@@ -432,7 +427,8 @@ def normalize_tables_use_first_row_as_header(tree):
                 parent.remove(first_tr)
 
         return tree
-    except Exception:
+    except Exception as e:
+        logger.error(e)
         return tree
 
 
@@ -504,164 +500,124 @@ def remove_page_header_footer_repeats(tree, min_repeat: int = 3, max_header_text
                             parent.remove(tag)
                     except Exception:
                         pass
-                        
-        logger.warn("removed repeated page headers/footers: headers=%s footers=%s", list(f_repeated), list(l_repeated))
+
+        logger.warning("removed repeated page headers/footers: headers=%s footers=%s", list(f_repeated), list(l_repeated))
         return tree
-    except Exception:
+    except Exception as e:
+        logger.error(e)
         return tree
 
 
 def etree_to_markdown(tree) -> str:
     """
-    High-performance conversion from lxml etree to markdown using direct traversal.
+    High-performance conversion from lxml etree to markdown using iterwalk (event-driven).
+    Replaces recursive _process_element to avoid truncation issues on large/heterogeneous trees.
     """
     if tree is None:
         return ""
-        
+
     output = StringIO()
-    
-    def _process_element(element, indent_level=0):
-        """Recursively process element and write to output buffer"""
-        if element is None:
-            return
-            
-        tag = element.tag.lower()
-        text = element.text or ""
-        
-        # Handle different HTML elements
-        if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-            level = int(tag[1])
-            output.write('\n' + '#' * level + ' ')
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-            output.write('\n\n')
-            
-        elif tag == 'p':
-            output.write('\n')
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-            output.write('\n\n')
-            
-        elif tag in ['strong', 'b']:
-            output.write('**')
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-            output.write('**')
-            
-        elif tag in ['em', 'i']:
-            output.write('*')
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-            output.write('*')
-            
-        elif tag == 'a':
-            href = element.get('href', '')
-            output.write('[')
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-            output.write(f']({href})')
-            
-        elif tag == 'img':
-            alt = element.get('alt', '')
-            src = element.get('src', '')
-            output.write(f'![{alt}]({src})')
-            
-        elif tag in ['ul', 'ol']:
-            output.write('\n')
-            for i, li in enumerate(element.xpath('.//li')):
-                if tag == 'ul':
-                    output.write('- ')
+
+    # safe localname extraction (handles namespaces)
+    def _localname(elem):
+        try:
+            return etree.QName(elem).localname.lower()
+        except Exception:
+            # fallback if QName fails
+            tag = getattr(elem, "tag", "")
+            return (tag or "").split("}")[-1].lower() if isinstance(tag, str) else ""
+
+    # stack to track open formatting/list context
+    stack = []
+
+    for event, elem in etree.iterwalk(tree, events=("start", "end")):
+        # skip comments / PIs / non-elements
+        if not isinstance(elem.tag, str):
+            continue
+
+        tag = _localname(elem)
+
+        if event == "start":
+            # headings
+            if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                level = int(tag[1])
+                output.write("\n" + "#" * level + " ")
+                if elem.text and elem.text.strip():
+                    output.write(elem.text.strip())
+            elif tag == "p":
+                output.write("\n")
+                if elem.text and elem.text.strip():
+                    output.write(elem.text.strip())
+            elif tag in ("strong", "b"):
+                output.write("**")
+                stack.append("**")
+                if elem.text and elem.text.strip():
+                    output.write(elem.text.strip())
+            elif tag in ("em", "i"):
+                output.write("*")
+                stack.append("*")
+                if elem.text and elem.text.strip():
+                    output.write(elem.text.strip())
+            elif tag == "a":
+                href = elem.get("href", "")
+                output.write("[")
+                stack.append(("a", href))
+                if elem.text and elem.text.strip():
+                    output.write(elem.text.strip())
+            elif tag == "img":
+                alt = elem.get("alt", "")
+                src = elem.get("src", "")
+                output.write(f"![{alt}]({src})")
+            elif tag in ("ul", "ol"):
+                stack.append(tag)  # push list context
+            elif tag == "li":
+                # find nearest list context
+                list_type = next((t for t in reversed(stack) if t in ("ul", "ol")), "ul")
+                if list_type == "ul":
+                    output.write("\n- ")
                 else:
-                    output.write(f'{i+1}. ')
-                li_text = _get_text_content(li)
-                if li_text.strip():
-                    output.write(li_text.strip())
-                output.write('\n')
-            output.write('\n')
-            
-        elif tag == 'table':
-            output.write('\n')
-            rows = element.xpath('.//tr')
-            if rows:
-                # Process header
-                first_row = rows[0]
-                cells = first_row.xpath('.//th | .//td')
-                if cells:
-                    output.write('| ')
-                    for cell in cells:
-                        cell_text = _get_text_content(cell).strip()
-                        output.write(cell_text + ' | ')
-                    output.write('\n|')
-                    for _ in cells:
-                        output.write(' --- |')
-                    output.write('\n')
-                    
-                    # Process remaining rows
-                    for row in rows[1:]:
-                        cells = row.xpath('.//th | .//td')
-                        if cells:
-                            output.write('| ')
-                            for cell in cells:
-                                cell_text = _get_text_content(cell).strip()
-                                output.write(cell_text + ' | ')
-                            output.write('\n')
-            output.write('\n')
-            
-        elif tag == 'br':
-            output.write('\n')
-            
-        elif tag == 'code':
-            output.write('`')
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-            output.write('`')
-            
-        elif tag == 'pre':
-            output.write('\n```\n')
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-            output.write('\n```\n\n')
-            
-        elif tag in ['div', 'span', 'body', 'html']:
-            # Pass-through elements
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-                
-        else:
-            # Default: treat as plain text container
-            if text.strip():
-                output.write(text.strip())
-            for child in element:
-                _process_element(child, indent_level)
-        
-        # Handle tail text (text after this element)
-        if element.tail and element.tail.strip():
-            output.write(' ' + element.tail.strip())
-    
-    _process_element(tree)
-    
-    # Clean up the output
+                    # keep numeric lists simple as '-' to avoid expensive index calculations
+                    output.write("\n- ")
+                if elem.text and elem.text.strip():
+                    output.write(elem.text.strip())
+            elif tag == "br":
+                output.write("\n")
+            elif tag == "pre":
+                output.write("\n```\n")
+                if elem.text:
+                    output.write(elem.text)
+            else:
+                # default: write element.text if present
+                if elem.text and elem.text.strip():
+                    output.write(elem.text.strip())
+
+        else:  # event == "end"
+            if tag in ("strong", "b", "em", "i"):
+                # pop matching formatter if present
+                if stack:
+                    top = stack.pop()
+                    output.write(top if isinstance(top, str) else "")
+            elif tag == "a":
+                if stack:
+                    top = stack.pop()
+                    if isinstance(top, tuple) and top[0] == "a":
+                        href = top[1]
+                        output.write(f"]({href})")
+            elif tag in ("ul", "ol"):
+                # pop list context if present
+                if stack and stack[-1] in ("ul", "ol"):
+                    stack.pop()
+                output.write("\n")
+            elif tag == "pre":
+                output.write("\n```\n\n")
+
+            # always handle tail text
+            if elem.tail and elem.tail.strip():
+                output.write(" " + elem.tail.strip())
+
     result = output.getvalue()
-    # Remove excessive newlines
-    result = re.sub(r'\n{3,}', '\n\n', result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
     result = result.strip()
-    
     return result
 
 
@@ -673,13 +629,13 @@ async def parse_file(file: UploadFile = File(...)):
     High-performance implementation using lxml for HTML processing and direct etree-to-markdown conversion.
     """
     start_time = asyncio.get_event_loop().time()
-    logger.warn("Starting request processing %r", start_time)
+    logger.debug("Starting request processing %r", start_time)
     body = await file.read()
     if not body:
         raise HTTPException(status_code=400, detail="empty file")
 
-    logger.warn("Received file: filename=%s content_type=%s size=%d", file.filename, file.content_type, len(body))
-    logger.warn("Reading file took %.3f seconds", asyncio.get_event_loop().time() - start_time)
+    logger.debug("Received file: filename=%s content_type=%s size=%d", file.filename, file.content_type, len(body))
+    logger.debug("Reading file took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
     async with httpx.AsyncClient() as client:
         try:
@@ -689,8 +645,8 @@ async def parse_file(file: UploadFile = File(...)):
             logger.exception("failed to fetch rmeta from Tika")
             raise HTTPException(status_code=502, detail=f"tika /rmeta error: {e}")
 
-        logger.warn("Fetched rmeta: main content length=%d, embedded records=%d", len(html) if html else 0, len(embedded_records) if embedded_records else 0)
-        logger.warn("Fetching rmeta took %.3f seconds", asyncio.get_event_loop().time() - start_time)
+        logger.debug("Fetched rmeta: main content length=%d, embedded records=%d", len(html) if html else 0, len(embedded_records) if embedded_records else 0)
+        logger.debug("Fetching rmeta took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         # parse once into lxml etree and reuse
         tree = sanitize_html(html)
@@ -698,28 +654,28 @@ async def parse_file(file: UploadFile = File(...)):
         # remove repeated per-page headers/footers emitted by Tika (e.g. <div class="page"> chunks)
         tree = await asyncio.to_thread(remove_page_header_footer_repeats, tree)
 
-        logger.warn("After remove_page_header_footer_repeats: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
-        logger.warn("Processing remove_page_header_footer_repeats took %.3f seconds", asyncio.get_event_loop().time() - start_time)
+        logger.debug("After remove_page_header_footer_repeats: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
+        logger.debug("Processing remove_page_header_footer_repeats took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         # normalize tables: use first row as header if no <th> exists
         tree = await asyncio.to_thread(normalize_tables_use_first_row_as_header, tree)
 
-        logger.warn("After normalize_tables_use_first_row_as_header: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
-        logger.warn("Processing normalize_tables_use_first_row_as_header took %.3f seconds", asyncio.get_event_loop().time() - start_time)
+        logger.debug("After normalize_tables_use_first_row_as_header: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
+        logger.debug("Processing normalize_tables_use_first_row_as_header took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         # process img tags to generate alt text
         tree = await asyncio.to_thread(inline_images_in_html, tree)   # only generate alt text
-        logger.warn("After inline_images_in_html: content length=%d, attachments inlined=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0, len(embedded_records) if embedded_records else 0)
-        logger.warn("Processing inline_images_in_html took %.3f seconds", asyncio.get_event_loop().time() - start_time)
+        logger.debug("After inline_images_in_html: content length=%d, attachments inlined=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0, len(embedded_records) if embedded_records else 0)
+        logger.debug("Processing inline_images_in_html took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         # unified removal of attachments/headers/tail filename lists
-        tree = await asyncio.to_thread(remove_non_content_blocks, tree, None)
-        logger.warn("After remove_non_content_blocks: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
-        logger.warn("Processing remove_non_content_blocks took %.3f seconds", asyncio.get_event_loop().time() - start_time)
+        tree = await asyncio.to_thread(remove_non_content_blocks, tree)
+        logger.debug("After remove_non_content_blocks: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
+        logger.debug("Processing remove_non_content_blocks took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         # convert etree -> Markdown using high-performance direct traversal
         markdown = await asyncio.to_thread(etree_to_markdown, tree)
-        logger.warn("Converted to markdown: length=%d", len(markdown) if markdown else 0)
-        logger.warn("Total processing took %.3f seconds", asyncio.get_event_loop().time() - start_time)
+        logger.debug("Converted to markdown: length=%d", len(markdown) if markdown else 0)
+        logger.debug("Total processing took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         return PlainTextResponse(content=markdown, media_type="text/markdown; charset=utf-8")
