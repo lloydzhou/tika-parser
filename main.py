@@ -13,8 +13,8 @@ from typing import Counter, Optional, Dict, List
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import PlainTextResponse
-from bs4 import BeautifulSoup, NavigableString, Tag
-from markdownify import markdownify as md
+from lxml import etree, html as lxml_html
+from io import StringIO
 
 TIKA_SERVER = os.environ.get("TIKA_SERVER", "http://localhost:9998")
 UNPACK_PATH = "/unpack/all"  # only endpoint needed for current tika version
@@ -24,12 +24,32 @@ logger.setLevel(logging.INFO)
 app = FastAPI(title="Tika HTML->Markdown Inliner")
 
 
-def sanitize_html(html: str) -> str:
+def _ensure_etree(html_or_etree):
+    """Return an lxml etree. If given an etree already, return it.
+    Use lxml parser for speed when parsing strings.
+    """
+    if isinstance(html_or_etree, etree._Element):
+        return html_or_etree
+    html = html_or_etree or ""
+    try:
+        # Parse with lxml html parser, which is more forgiving than xml parser
+        return lxml_html.fromstring(html)
+    except Exception:
+        # Fallback for malformed HTML
+        try:
+            return lxml_html.fragment_fromstring(html)
+        except Exception:
+            # Last resort: create empty document
+            return lxml_html.fromstring("<html><body></body></html>")
+
+
+def sanitize_html(html: str) -> etree._Element:
     """
     Sanitize HTML to remove problematic control characters and all <title> tags.
+    Returns lxml etree element.
     """
     if not html:
-        return html
+        return lxml_html.fromstring("<html><body></body></html>")
 
     # Remove explicit numeric NUL references (decimal and hex)
     html = re.sub(r'(?i)&#0+;|&#x0+;?', '', html)
@@ -37,35 +57,16 @@ def sanitize_html(html: str) -> str:
     # Remove control characters except \t (09), \n (0A), \r (0D)
     html = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', html)
 
-    # Parse and remove all <title> tags unconditionally
+    # Parse with lxml and remove all <title> tags
     try:
-        soup = BeautifulSoup(html, "html.parser")
-        for title in soup.find_all("title"):
-            title.decompose()
-        return str(soup)
+        tree = lxml_html.fromstring(html)
+        # Remove title elements
+        for title in tree.xpath(".//title"):
+            title.getparent().remove(title)
+        return tree
     except Exception:
-        # If parsing fails for any reason, return the cleaned html so far
-        return html
-
-
-async def fetch_attachments_zip(client: httpx.AsyncClient, body: bytes, timeout: int = 60) -> Optional[bytes]:
-    """
-    Only request the single /unpack/all endpoint (current tika version).
-    Return zip bytes if valid zip received, otherwise None.
-    """
-    try:
-        url = TIKA_SERVER.rstrip("/") + UNPACK_PATH
-        resp = await client.put(url, content=body, timeout=timeout)
-        if resp.status_code == 200 and resp.content:
-            try:
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as _:
-                    return resp.content
-            except zipfile.BadZipFile:
-                logger.debug("Response from %s not a valid zip", url)
-                return None
-    except httpx.RequestError:
-        logger.debug("request to unpack endpoint failed", exc_info=True)
-    return None
+        # If parsing fails, return minimal document
+        return lxml_html.fromstring("<html><body></body></html>")
 
 
 async def fetch_rmeta(client: httpx.AsyncClient, body: bytes, timeout: int = 60):
@@ -111,29 +112,7 @@ async def fetch_rmeta(client: httpx.AsyncClient, body: bytes, timeout: int = 60)
         main_content = records[0].get("X-TIKA:content", "") or ""
         embedded = records[1:]
 
-    main_content = sanitize_html(main_content)
     return main_content, embedded
-
-
-def extract_zip_files(zip_bytes: bytes) -> Dict[str, bytes]:
-    """
-    Return mapping basename -> bytes for all files in zip (recursive).
-    If duplicate basenames occur, last wins.
-    """
-    files = {}
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-        for info in z.infolist():
-            if info.is_dir():
-                continue
-            name = os.path.basename(info.filename)
-            if not name:
-                continue
-            try:
-                data = z.read(info.filename)
-            except Exception:
-                continue
-            files[name] = data
-    return files
 
 
 def _extract_sentence_fragment(text: str, which: str = "last", max_len: int = 200) -> str:
@@ -162,71 +141,64 @@ def _extract_sentence_fragment(text: str, which: str = "last", max_len: int = 20
     return fragment
 
 
-def _gather_text_from_previous(img_tag: Tag, max_ancestors: int = 4) -> str:
-    # 1) previous siblings at same level
-    for sib in img_tag.previous_siblings:
-        if isinstance(sib, NavigableString):
-            txt = sib.strip()
-            if txt and not re.fullmatch(r'[\s\W_]+', txt):
-                return txt
-        elif isinstance(sib, Tag):
-            txt = sib.get_text(" ", strip=True)
-            if txt and not re.fullmatch(r'[\s\W_]+', txt):
-                return txt
+def _get_text_content(element):
+    """Get text content from an lxml element, similar to BeautifulSoup's get_text()"""
+    if element is None:
+        return ""
+    return (element.text_content() or "").strip()
 
-    # 2) up the ancestors, check previous siblings of each ancestor
-    ancestors = list(img_tag.parents)[:max_ancestors]
-    for ancestor in ancestors:
-        for prev in getattr(ancestor, "previous_siblings", []):
-            if isinstance(prev, NavigableString):
-                txt = prev.strip()
-                if txt and not re.fullmatch(r'[\s\W_]+', txt):
-                    return txt
-            elif isinstance(prev, Tag):
-                txt = prev.get_text(" ", strip=True)
-                if txt and not re.fullmatch(r'[\s\W_]+', txt):
-                    return txt
-    # 3) fallback: use find_previous(string=True)
-    prev_node = img_tag.find_previous(string=True)
-    if prev_node:
-        ptxt = prev_node.strip()
-        if ptxt and not re.fullmatch(r'[\s\W_]+', ptxt):
-            return ptxt
+
+def _gather_text_from_previous(img_tag, max_ancestors: int = 4) -> str:
+    """Gather meaningful text from previous siblings/ancestors using lxml"""
+    current = img_tag.getprevious()
+    while current is not None:
+        text = _get_text_content(current)
+        if text and not re.fullmatch(r'[\s\W_]+', text):
+            return text
+        current = current.getprevious()
+    
+    # Check ancestors
+    parent = img_tag.getparent()
+    ancestors_checked = 0
+    while parent is not None and ancestors_checked < max_ancestors:
+        prev_sibling = parent.getprevious()
+        while prev_sibling is not None:
+            text = _get_text_content(prev_sibling)
+            if text and not re.fullmatch(r'[\s\W_]+', text):
+                return text
+            prev_sibling = prev_sibling.getprevious()
+        parent = parent.getparent()
+        ancestors_checked += 1
+    
     return ""
 
 
-def _gather_text_from_next(img_tag: Tag, max_ancestors: int = 4) -> str:
-    for sib in img_tag.next_siblings:
-        if isinstance(sib, NavigableString):
-            txt = sib.strip()
-            if txt and not re.fullmatch(r'[\s\W_]+', txt):
-                return txt
-        elif isinstance(sib, Tag):
-            txt = sib.get_text(" ", strip=True)
-            if txt and not re.fullmatch(r'[\s\W_]+', txt):
-                return txt
-
-    ancestors = list(img_tag.parents)[:max_ancestors]
-    for ancestor in ancestors:
-        for nxt in getattr(ancestor, "next_siblings", []):
-            if isinstance(nxt, NavigableString):
-                txt = nxt.strip()
-                if txt and not re.fullmatch(r'[\s\W_]+', txt):
-                    return txt
-            elif isinstance(nxt, Tag):
-                txt = nxt.get_text(" ", strip=True)
-                if txt and not re.fullmatch(r'[\s\W_]+', txt):
-                    return txt
-
-    next_node = img_tag.find_next(string=True)
-    if next_node:
-        ntxt = next_node.strip()
-        if ntxt and not re.fullmatch(r'[\s\W_]+', ntxt):
-            return ntxt
+def _gather_text_from_next(img_tag, max_ancestors: int = 4) -> str:
+    """Gather meaningful text from next siblings/ancestors using lxml"""
+    current = img_tag.getnext()
+    while current is not None:
+        text = _get_text_content(current)
+        if text and not re.fullmatch(r'[\s\W_]+', text):
+            return text
+        current = current.getnext()
+    
+    # Check ancestors
+    parent = img_tag.getparent()
+    ancestors_checked = 0
+    while parent is not None and ancestors_checked < max_ancestors:
+        next_sibling = parent.getnext()
+        while next_sibling is not None:
+            text = _get_text_content(next_sibling)
+            if text and not re.fullmatch(r'[\s\W_]+', text):
+                return text
+            next_sibling = next_sibling.getnext()
+        parent = parent.getparent()
+        ancestors_checked += 1
+    
     return ""
 
 
-def _build_title_from_context(img_tag: Tag) -> str:
+def _build_title_from_context(img_tag) -> str:
     prev_text = _gather_text_from_previous(img_tag)
     next_text = _gather_text_from_next(img_tag)
 
@@ -245,93 +217,29 @@ def _build_title_from_context(img_tag: Tag) -> str:
     return title.strip()
 
 
-def inline_images_in_html(html: str, attachments: dict) -> str:
+def inline_images_in_html(tree):
     """
-    attachments: dict basename -> bytes
-    returns processed html (string) with <img> src replaced to data: URIs when possible
-
-    Behavior:
-      - If attachment is WMF/EMF, try to rasterize to PNG via Pillow and inline PNG.
-      - Overwrite alt text with generated context text; remove title.
+    Process img tags in lxml etree to generate alt text from context.
+    Only generates alt text, doesn't actually inline images for performance.
+    Returns the modified tree.
     """
-    if html and html[0] == "\x00":
-        html = html.lstrip("\x00")
-
-    soup = BeautifulSoup(html, "html.parser")
-    imgs = soup.find_all("img")
-    lower_map = {k.lower(): k for k in attachments.keys()}
-
+    tree = _ensure_etree(tree)
+    
+    # Find all img elements using xpath
+    imgs = tree.xpath(".//img")
+    
     for img in imgs:
-        src = img.get("src", "").strip()
-        if not src or src.startswith("data:"):
-            continue
-
-        candidates = set()
-        candidates.add(src)
-        candidates.add(os.path.basename(src))
-        if "?" in src:
-            candidates.add(os.path.basename(src.split("?", 1)[0]))
-        if "#" in src:
-            candidates.add(os.path.basename(src.split("#", 1)[0]))
-        if ":" in src:
-            candidates.add(src.split(":", 1)[-1])
-        if "/" in src:
-            candidates.add(src.split("/")[-1])
-
-        matched_data = None
-        matched_name = None
-
-        for c in candidates:
-            cbase = os.path.basename(c).lower()
-            if cbase in lower_map:
-                matched_name = lower_map[cbase]
-                matched_data = attachments[matched_name]
-                break
-
-        if matched_data:
-            # Only inline common raster images that imghdr recognizes. Drop other formats (e.g. WMF/EMF).
-            try:
-                img_type = imghdr.what(None, h=matched_data)
-            except Exception:
-                img_type = None
-
-            if not img_type:
-                # cannot recognize raster image -> remove the <img> tag entirely
-                try:
-                    img.decompose()
-                except Exception:
-                    pass
-                continue
-
-            final_bytes = matched_data
-            final_mime = f"image/{img_type}"
-
-            # inline as data URI
-            try:
-                b64 = base64.b64encode(final_bytes).decode("ascii")
-                data_uri = f"data:{final_mime};base64,{b64}"
-                img["src"] = data_uri
-            except Exception:
-                logger.exception("failed to base64 image for %s", matched_name)
-                try:
-                    img.decompose()
-                except Exception:
-                    pass
-                continue
-
-            # remove any existing title attribute to ensure no title output
-            if "title" in img.attrs:
-                del img.attrs["title"]
-
-            # ALWAYS replace alt text with generated context text (do not preserve existing alt)
-            alt_text = _build_title_from_context(img)
-            img["alt"] = alt_text if alt_text else ""
-
-            continue
-
-        # If no match in attachments, do NOT try to fetch remote images.
-        # Leave src unchanged.
-    return str(soup)
+        alt_text = _build_title_from_context(img)
+        if alt_text:
+            img.set("alt", alt_text)
+        else:
+            img.set("alt", "")
+        
+        # Remove title attribute if present
+        if "title" in img.attrib:
+            del img.attrib["title"]
+    
+    return tree
 
 
 # Filename pattern heuristic used by non-content removal
@@ -344,280 +252,417 @@ def _normalize_text(s: str) -> str:
     return re.sub(r'\s+', ' ', s).strip()
 
 
-def remove_non_content_blocks(
-    html: str,
-    attachments: Optional[dict] = None,
-    min_header_repeat: int = 3,
-    min_package_group: int = 2,
-    tail_scan_limit: int = 20,
-    max_header_text_len: int = 200,
-) -> str:
+def remove_non_content_blocks(tree, min_header_repeat: int = 3, min_package_group: int = 2, tail_scan_limit: int = 20, max_header_text_len: int = 200):
     """
-    Remove attachment-like / repeated header / tail filename-list blocks from HTML.
-
-    Heuristics performed (conservative defaults):
-      1) Find tags with class containing 'package-entry' whose H1/H2/H3 text looks like a filename.
-         If >= min_package_group such nodes exist, remove them all.
-         Otherwise, if they are concentrated at document tail, remove them.
-      2) Remove any tag (<a>, <p>, <div>, <span>, headings, <li>) whose visible text exactly matches
-         a basename in attachments (case-insensitive). If attachments is None/empty this step is skipped.
-      3) Remove trailing nodes at document end that look like comma/space-separated filenames that are
-         all in attachments (or look like filename pattern when attachments not provided).
-      4) Detect repeated short top-level blocks (first consider_top_n children) and remove those whose
-         normalized text appears >= min_header_repeat times (useful to drop page headers).
-         Only consider short texts (<= max_header_text_len) to avoid removing actual paragraphs.
-
-    Returns modified html string.
+    Remove attachment-like / repeated header / tail filename-list blocks from HTML using lxml.
+    Returns the modified tree.
     """
-    if not html:
-        return html
+    tree = _ensure_etree(tree)
+    if tree is None:
+        return tree
 
     try:
-        soup = BeautifulSoup(html, "html.parser")
-        body = soup.body or soup
+        # Get body or use tree itself
+        body_elements = tree.xpath(".//body")
+        body = body_elements[0] if body_elements else tree
 
-        # attachments basenames lowercase set for quick membership test
-        attachments_basenames = set()
-        if attachments:
-            attachments_basenames = {name.lower() for name in attachments.keys()}
-
-        # 1) package-entry handling
+        # 1) package-entry handling - find elements with class containing 'package-entry'
         package_tags = []
-        for tag in soup.find_all(class_=lambda c: c and 'package-entry' in str(c).lower()):
+        for element in tree.xpath(".//*[contains(@class, 'package-entry')]"):
             txt = ""
-            for h in tag.find_all(['h1', 'h2', 'h3'], limit=1):
-                txt = _normalize_text(h.get_text(" ", strip=True))
-                break
-            if not txt:
-                txt = _normalize_text(tag.get_text(" ", strip=True))
+            # Look for h1, h2, h3 first
+            headers = element.xpath(".//h1 | .//h2 | .//h3")
+            if headers:
+                txt = _normalize_text(_get_text_content(headers[0]))
+            else:
+                txt = _normalize_text(_get_text_content(element))
+            
             if txt and _FILENAME_RE.match(txt):
-                package_tags.append((tag, txt))
+                package_tags.append((element, txt))
 
         if len(package_tags) >= min_package_group:
-            for tag, _ in package_tags:
+            for element, _ in package_tags:
                 try:
-                    tag.decompose()
+                    parent = element.getparent()
+                    if parent is not None:
+                        parent.remove(element)
                 except Exception:
                     pass
         else:
+            # Check if package tags are concentrated at document tail
             if package_tags:
-                tail_children = [c for c in (body.contents or []) if isinstance(c, Tag)][-tail_scan_limit:]
+                all_children = list(body)
+                tail_children = all_children[-tail_scan_limit:] if len(all_children) > tail_scan_limit else all_children
                 concentrated = all(
-                    any(tag is child or tag in child.find_all(True) for child, _ in package_tags)
+                    any(element == child or element in child.iter() for element, _ in package_tags)
                     for child in tail_children
                 )
                 if concentrated:
-                    for tag, _ in package_tags:
+                    for element, _ in package_tags:
                         try:
-                            tag.decompose()
+                            parent = element.getparent()
+                            if parent is not None:
+                                parent.remove(element)
                         except Exception:
                             pass
 
-        # 2) remove nodes whose visible text exactly equals an attachment basename
-        if attachments_basenames:
-            for tag in soup.find_all(['a', 'p', 'div', 'span', 'li'] + [f'h{i}' for i in range(1,7)]):
-                txt = _normalize_text(tag.get_text(" ", strip=True))
-                if not txt:
-                    continue
-                if txt.lower() in attachments_basenames:
-                    try:
-                        tag.decompose()
-                    except Exception:
-                        pass
-                    continue
-                if tag.name == 'a':
-                    href = tag.get('href', '')
-                    if href:
-                        href_basename = href.split('?', 1)[0].split('#', 1)[0].split('/')[-1].lower()
-                        if href_basename in attachments_basenames:
-                            try:
-                                tag.decompose()
-                            except Exception:
-                                pass
-                            continue
-
         # 3) remove trailing nodes that look like comma/space separated filenames
-        body_children = [c for c in (body.contents or []) if isinstance(c, Tag)]
+        body_children = list(body)
         for _ in range(3):
             if not body_children:
                 break
             last = body_children[-1]
-            txt = _normalize_text(last.get_text(" ", strip=True))
+            txt = _normalize_text(_get_text_content(last))
             if not txt:
                 try:
-                    last.decompose()
+                    parent = last.getparent()
+                    if parent is not None:
+                        parent.remove(last)
+                        body_children.pop()
                 except Exception:
                     pass
-                body_children.pop()
                 continue
+                
             tokens = [t for t in re.split(r'[\s,;]+', txt) if t]
             if not tokens:
                 break
 
-            if attachments_basenames:
-                if all(tok.lower() in attachments_basenames for tok in tokens):
-                    try:
-                        last.decompose()
-                    except Exception:
-                        pass
-                    body_children.pop()
-                    continue
-            else:
-                if all(_FILENAME_RE.match(tok) for tok in tokens):
-                    try:
-                        last.decompose()
-                    except Exception:
-                        pass
-                    body_children.pop()
-                    continue
+            should_remove = all(_FILENAME_RE.match(tok) for tok in tokens)
+               
+            if should_remove:
+                try:
+                    parent = last.getparent()
+                    if parent is not None:
+                        parent.remove(last)
+                        body_children.pop()
+                except Exception:
+                    pass
+                continue
             break
 
         # 4) repeated header detection among top-level children
-        top_children = [c for c in body.contents if isinstance(c, Tag)]
+        top_children = list(body)
         consider_top_n = min(8, len(top_children))
         candidates = []
         for child in top_children[:consider_top_n]:
-            txt = _normalize_text(child.get_text(" ", strip=True))
+            txt = _normalize_text(_get_text_content(child))
             if txt and len(txt) <= max_header_text_len:
                 candidates.append(txt)
+                
         if candidates:
             counts = Counter(candidates)
             repeated = {t for t, cnt in counts.items() if cnt >= min_header_repeat}
             if repeated:
-                for tag in soup.find_all():
-                    if not isinstance(tag, Tag):
-                        continue
-                    txt = _normalize_text(tag.get_text(" ", strip=True))
-                    if txt in repeated:
-                        try:
-                            tag.decompose()
-                        except Exception:
-                            pass
+                for tag in tree.iter():
+                    if hasattr(tag, 'tag'):  # Make sure it's an element, not a comment/text
+                        txt = _normalize_text(_get_text_content(tag))
+                        if txt in repeated:
+                            try:
+                                parent = tag.getparent()
+                                if parent is not None:
+                                    parent.remove(tag)
+                            except Exception:
+                                pass
 
-        return str(soup)
+        return tree
     except Exception:
-        return html
+        return tree
 
 
-def normalize_tables_use_first_row_as_header(html: str) -> str:
+def normalize_tables_use_first_row_as_header(tree):
     """
-    For tables that lack any <th>, take the first <tr> as header:
-    - create a <thead> with that row's cells converted to <th>
-    - remove the original first row from the table body
-    This makes markdownify treat the first row as the header.
+    For tables that lack any <th>, take the first <tr> as header using lxml.
+    Returns the modified tree.
     """
-    if not html:
-        return html
+    tree = _ensure_etree(tree)
+    if tree is None:
+        return tree
+        
     try:
-        soup = BeautifulSoup(html, "html.parser")
-        for table in soup.find_all("table"):
-            # skip if any <th> already exists
-            if table.find("th"):
+        for table in tree.xpath(".//table"):
+            # Check if table already has th elements
+            if table.xpath(".//th"):
                 continue
 
-            # find the first tr in the table
+            # Find first tr
             first_tr = None
-            # prefer rows inside tbody if present
-            tbody = table.find("tbody")
-            if tbody:
-                first_tr = tbody.find("tr")
-            if not first_tr:
-                first_tr = table.find("tr")
-            if not first_tr:
+            tbody_elements = table.xpath(".//tbody")
+            if tbody_elements:
+                first_tr_elements = tbody_elements[0].xpath(".//tr")
+                if first_tr_elements:
+                    first_tr = first_tr_elements[0]
+            
+            if first_tr is None:
+                first_tr_elements = table.xpath(".//tr")
+                if first_tr_elements:
+                    first_tr = first_tr_elements[0]
+                    
+            if first_tr is None:
                 continue
 
-            # collect cells from that row
-            cells = first_tr.find_all(["td", "th"])
+            # Get cells from first row
+            cells = first_tr.xpath(".//td | .//th")
             if not cells:
                 continue
 
-            thead = soup.new_tag("thead")
-            tr_head = soup.new_tag("tr")
+            # Create thead element
+            thead = etree.Element("thead")
+            tr_head = etree.Element("tr")
+            
             for cell in cells:
-                th = soup.new_tag("th")
-                # move contents into the new th
-                for c in list(cell.contents):
-                    th.append(c)
+                th = etree.Element("th")
+                # Copy all content from cell to th
+                th.text = cell.text
+                th.tail = cell.tail
+                for child in cell:
+                    th.append(child)
+                # Copy attributes
+                for key, value in cell.attrib.items():
+                    th.set(key, value)
                 tr_head.append(th)
+                
             thead.append(tr_head)
-
-            # insert thead at the beginning of the table
+            
+            # Insert thead at the beginning of table
             table.insert(0, thead)
+            
+            # Remove the original first row
+            parent = first_tr.getparent()
+            if parent is not None:
+                parent.remove(first_tr)
 
-            # remove the original first row
-            first_tr.decompose()
-
-        return str(soup)
+        return tree
     except Exception:
-        # on any parsing error, return original html unchanged
-        return html
+        return tree
 
 
-def remove_page_header_footer_repeats(html: str, min_repeat: int = 3, max_header_text_len: int = 200) -> str:
+def remove_page_header_footer_repeats(tree, min_repeat: int = 3, max_header_text_len: int = 200):
     """
-    Detect repeated short blocks at the start or end of per-page containers (e.g. <div class="page">)
-    and remove them when they occur on at least `min_repeat` pages.
-
-    This helps remove headers/footers that Tika emits inside each page block.
+    Detect repeated short blocks at the start or end of per-page containers using lxml.
+    Returns the modified tree.
     """
-    if not html:
-        return html
+    tree = _ensure_etree(tree)
+    if tree is None:
+        return tree
+        
     try:
-        soup = BeautifulSoup(html, "html.parser")
-        # find page containers (class contains 'page')
-        pages = [p for p in soup.find_all(True, class_=lambda c: c and 'page' in str(c).lower())]
+        # Find page elements - look for elements with class containing 'page'
+        pages = tree.xpath(".//*[contains(@class, 'page')]")
         if not pages:
-            # fallback: if no page divs, nothing to do
-            return html
+            return tree
 
         first_texts = []
         last_texts = []
         page_tags = []
-        for p in pages:
-            # collect candidate first/last meaningful tag text in this page
-            tags = [t for t in p.find_all(['p','div','h1','h2','h3','h4','h5','h6','span'], recursive=True)]
+        
+        for page in pages:
+            # Find all text-bearing elements in this page
+            tags = page.xpath(".//p | .//div | .//h1 | .//h2 | .//h3 | .//h4 | .//h5 | .//h6 | .//span")
+            
             first_txt = ""
             last_txt = ""
-            for t in tags:
-                ttxt = _normalize_text(t.get_text(" ", strip=True))
-                if ttxt and len(ttxt) <= max_header_text_len:
-                    first_txt = ttxt
+            
+            # Find first meaningful text
+            for tag in tags:
+                txt = _normalize_text(_get_text_content(tag))
+                if txt and len(txt) <= max_header_text_len:
+                    first_txt = txt
                     break
-            for t in reversed(tags):
-                ttxt = _normalize_text(t.get_text(" ", strip=True))
-                if ttxt and len(ttxt) <= max_header_text_len:
-                    last_txt = ttxt
+                    
+            # Find last meaningful text
+            for tag in reversed(tags):
+                txt = _normalize_text(_get_text_content(tag))
+                if txt and len(txt) <= max_header_text_len:
+                    last_txt = txt
                     break
+                    
             first_texts.append(first_txt)
             last_texts.append(last_txt)
-            page_tags.append((p, tags))
+            page_tags.append((page, tags))
 
-        from collections import Counter as _Counter
-        fcounts = _Counter([t for t in first_texts if t])
-        lcounts = _Counter([t for t in last_texts if t])
+        fcounts = Counter([t for t in first_texts if t])
+        lcounts = Counter([t for t in last_texts if t])
 
         f_repeated = {t for t, cnt in fcounts.items() if cnt >= min_repeat}
         l_repeated = {t for t, cnt in lcounts.items() if cnt >= min_repeat}
 
         if not f_repeated and not l_repeated:
-            return html
+            return tree
 
-        # remove matching tags within each page
-        for p, tags in page_tags:
+        # Remove repeated elements
+        for page, tags in page_tags:
             for tag in tags:
                 try:
-                    ttxt = _normalize_text(tag.get_text(" ", strip=True))
+                    txt = _normalize_text(_get_text_content(tag))
                 except Exception:
                     continue
-                if ttxt in f_repeated or ttxt in l_repeated:
+                    
+                if txt in f_repeated or txt in l_repeated:
                     try:
-                        tag.decompose()
+                        parent = tag.getparent()
+                        if parent is not None:
+                            parent.remove(tag)
                     except Exception:
                         pass
+                        
         logger.warn("removed repeated page headers/footers: headers=%s footers=%s", list(f_repeated), list(l_repeated))
-        return str(soup)
+        return tree
     except Exception:
-        return html
+        return tree
+
+
+def etree_to_markdown(tree) -> str:
+    """
+    High-performance conversion from lxml etree to markdown using direct traversal.
+    """
+    if tree is None:
+        return ""
+        
+    output = StringIO()
+    
+    def _process_element(element, indent_level=0):
+        """Recursively process element and write to output buffer"""
+        if element is None:
+            return
+            
+        tag = element.tag.lower()
+        text = element.text or ""
+        
+        # Handle different HTML elements
+        if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            level = int(tag[1])
+            output.write('\n' + '#' * level + ' ')
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+            output.write('\n\n')
+            
+        elif tag == 'p':
+            output.write('\n')
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+            output.write('\n\n')
+            
+        elif tag in ['strong', 'b']:
+            output.write('**')
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+            output.write('**')
+            
+        elif tag in ['em', 'i']:
+            output.write('*')
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+            output.write('*')
+            
+        elif tag == 'a':
+            href = element.get('href', '')
+            output.write('[')
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+            output.write(f']({href})')
+            
+        elif tag == 'img':
+            alt = element.get('alt', '')
+            src = element.get('src', '')
+            output.write(f'![{alt}]({src})')
+            
+        elif tag in ['ul', 'ol']:
+            output.write('\n')
+            for i, li in enumerate(element.xpath('.//li')):
+                if tag == 'ul':
+                    output.write('- ')
+                else:
+                    output.write(f'{i+1}. ')
+                li_text = _get_text_content(li)
+                if li_text.strip():
+                    output.write(li_text.strip())
+                output.write('\n')
+            output.write('\n')
+            
+        elif tag == 'table':
+            output.write('\n')
+            rows = element.xpath('.//tr')
+            if rows:
+                # Process header
+                first_row = rows[0]
+                cells = first_row.xpath('.//th | .//td')
+                if cells:
+                    output.write('| ')
+                    for cell in cells:
+                        cell_text = _get_text_content(cell).strip()
+                        output.write(cell_text + ' | ')
+                    output.write('\n|')
+                    for _ in cells:
+                        output.write(' --- |')
+                    output.write('\n')
+                    
+                    # Process remaining rows
+                    for row in rows[1:]:
+                        cells = row.xpath('.//th | .//td')
+                        if cells:
+                            output.write('| ')
+                            for cell in cells:
+                                cell_text = _get_text_content(cell).strip()
+                                output.write(cell_text + ' | ')
+                            output.write('\n')
+            output.write('\n')
+            
+        elif tag == 'br':
+            output.write('\n')
+            
+        elif tag == 'code':
+            output.write('`')
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+            output.write('`')
+            
+        elif tag == 'pre':
+            output.write('\n```\n')
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+            output.write('\n```\n\n')
+            
+        elif tag in ['div', 'span', 'body', 'html']:
+            # Pass-through elements
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+                
+        else:
+            # Default: treat as plain text container
+            if text.strip():
+                output.write(text.strip())
+            for child in element:
+                _process_element(child, indent_level)
+        
+        # Handle tail text (text after this element)
+        if element.tail and element.tail.strip():
+            output.write(' ' + element.tail.strip())
+    
+    _process_element(tree)
+    
+    # Clean up the output
+    result = output.getvalue()
+    # Remove excessive newlines
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    result = result.strip()
+    
+    return result
 
 
 @app.post("/", response_class=PlainTextResponse)
@@ -625,67 +670,56 @@ async def parse_file(file: UploadFile = File(...)):
     """
     Accept a multipart form file under 'file', call external Tika server to get HTML and attachments.
     Returns Markdown (text/markdown).
-    Only inlines images that are present in Tika's /unpack/all attachments; remote images are left as-is.
-    Fetch attachments only when the HTML actually contains <img> tags.
+    High-performance implementation using lxml for HTML processing and direct etree-to-markdown conversion.
     """
+    start_time = asyncio.get_event_loop().time()
+    logger.warn("Starting request processing %r", start_time)
     body = await file.read()
     if not body:
         raise HTTPException(status_code=400, detail="empty file")
 
+    logger.warn("Received file: filename=%s content_type=%s size=%d", file.filename, file.content_type, len(body))
+    logger.warn("Reading file took %.3f seconds", asyncio.get_event_loop().time() - start_time)
+
     async with httpx.AsyncClient() as client:
         try:
             # Use /rmeta to obtain the main document content and embedded records.
-            # This avoids the problem where /tika's HTML may include text extracted from embedded
-            # resources (e.g., WMF formulas) appended into the main content.
             html, embedded_records = await fetch_rmeta(client, body)
         except Exception as e:
             logger.exception("failed to fetch rmeta from Tika")
             raise HTTPException(status_code=502, detail=f"tika /rmeta error: {e}")
 
-        # Build a simple map of embedded resource basenames -> metadata from rmeta records
-        # embedded_meta = {}
-        # for rec in (embedded_records if 'embedded_records' in locals() and embedded_records else []):
-        #     # resourceName is common; fallback to embedded path if present
-        #     rname = rec.get('resourceName') or rec.get('X-TIKA:embedded_resource_path') or rec.get('X-TIKA:embedded_resource_name')
-        #     if rname:
-        #         b = os.path.basename(rname).lower()
-        #         embedded_meta[b] = rec
+        logger.warn("Fetched rmeta: main content length=%d, embedded records=%d", len(html) if html else 0, len(embedded_records) if embedded_records else 0)
+        logger.warn("Fetching rmeta took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
-        logger.info("fetched rmeta: main content length=%d, embedded records=%d", len(html) if html else 0, len(embedded_meta))
+        # parse once into lxml etree and reuse
+        tree = sanitize_html(html)
 
         # remove repeated per-page headers/footers emitted by Tika (e.g. <div class="page"> chunks)
-        html_inlined = await asyncio.to_thread(remove_page_header_footer_repeats, html_inlined)
+        tree = await asyncio.to_thread(remove_page_header_footer_repeats, tree)
+
+        logger.warn("After remove_page_header_footer_repeats: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
+        logger.warn("Processing remove_page_header_footer_repeats took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         # normalize tables: use first row as header if no <th> exists
-        html_inlined = await asyncio.to_thread(normalize_tables_use_first_row_as_header, html_inlined)
+        tree = await asyncio.to_thread(normalize_tables_use_first_row_as_header, tree)
 
-        # check if HTML contains any <img> tags; only then fetch attachments
-        soup_check = BeautifulSoup(html or "", "html.parser")
-        has_img = bool(soup_check.find("img"))
+        logger.warn("After normalize_tables_use_first_row_as_header: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
+        logger.warn("Processing normalize_tables_use_first_row_as_header took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
-        attachments = {}
-        if has_img:
-            zip_bytes = None
-            try:
-                zip_bytes = await fetch_attachments_zip(client, body)
-            except Exception:
-                logger.exception("failed to fetch attachments from Tika (ignored)")
-
-            if zip_bytes:
-                # extraction is CPU/IO bound -> run in thread to avoid blocking loop
-                attachments = await asyncio.to_thread(extract_zip_files, zip_bytes)
-
-        # inline images from attachments ONLY (if attachments empty, inline_images_in_html will leave imgs unchanged)
-        html_inlined = await asyncio.to_thread(inline_images_in_html, html, attachments)
+        # process img tags to generate alt text
+        tree = await asyncio.to_thread(inline_images_in_html, tree)   # only generate alt text
+        logger.warn("After inline_images_in_html: content length=%d, attachments inlined=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0, len(embedded_records) if embedded_records else 0)
+        logger.warn("Processing inline_images_in_html took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         # unified removal of attachments/headers/tail filename lists
-        if attachments:
-            html_inlined = await asyncio.to_thread(remove_non_content_blocks, html_inlined, attachments)
-        else:
-            html_inlined = await asyncio.to_thread(remove_non_content_blocks, html_inlined, None)
+        tree = await asyncio.to_thread(remove_non_content_blocks, tree, None)
+        logger.warn("After remove_non_content_blocks: content length=%d", len(etree.tostring(tree, encoding='unicode')) if tree is not None else 0)
+        logger.warn("Processing remove_non_content_blocks took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
-        # convert HTML -> Markdown
-        # set autolinks=False so markdownify will emit explicit [url](url) instead of <url>
-        markdown = await asyncio.to_thread(md, html_inlined, heading_style="ATX", autolinks=False)
+        # convert etree -> Markdown using high-performance direct traversal
+        markdown = await asyncio.to_thread(etree_to_markdown, tree)
+        logger.warn("Converted to markdown: length=%d", len(markdown) if markdown else 0)
+        logger.warn("Total processing took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
         return PlainTextResponse(content=markdown, media_type="text/markdown; charset=utf-8")

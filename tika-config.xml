@@ -2,7 +2,11 @@
 <properties>
   <parsers>
     <!-- Use the default parser list, but override specific parser configs below -->
-    <parser class="org.apache.tika.parser.DefaultParser"/>
+    <parser class="org.apache.tika.parser.DefaultParser">
+      <params>
+        <param name="writeFileNameToContent" type="bool">false</param>
+      </params>
+    </parser>
 
     <!-- Configuration for classic Microsoft Office files (.doc, .xls, .ppt) -->
     <parser class="org.apache.tika.parser.microsoft.OfficeParser">
@@ -10,6 +14,7 @@
         <param name="includeHeadersAndFooters" type="bool">false</param>
         <!-- Do not extract content from shapes (e.g., text boxes, formulas) -->
         <param name="includeShapeBasedContent" type="bool">false</param>
+        <param name="convertEmbeddedImagesToBase64" type="bool">true</param>
       </params>
     </parser>
 
@@ -19,6 +24,7 @@
         <param name="includeHeadersAndFooters" type="bool">false</param>
         <!-- Do not extract content from shapes (e.g., text boxes, formulas) -->
         <param name="includeShapeBasedContent" type="bool">false</param>
+        <param name="convertEmbeddedImagesToBase64" type="bool">true</param>
       </params>
     </parser>
 
@@ -34,6 +40,7 @@
         <param name="sortByPosition" type="bool">false</param>
         <!-- Extract inline images -->
         <param name="extractInlineImages" type="bool">true</param>
+        <param name="convertEmbeddedImagesToBase64" type="bool">true</param>
       </params>
     </parser>
   </parsers>
