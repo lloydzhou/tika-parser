@@ -157,25 +157,23 @@ def _get_text_content(element):
     if text:
         return text
 
-    # If no text, but contains <img> descendants, use their alt/title/src as content so
-    # image-only blocks are not considered empty and removed.
-    alt_texts = []
-    for node in element.iter():
-        tag = getattr(node, "tag", "")
-        if not isinstance(tag, str):
-            continue
-        local = tag.split("}")[-1].lower()
-        if local == "img":
-            alt = (node.get("alt") or node.get("title") or node.get("src") or "").strip()
-            if alt:
-                alt_texts.append(alt)
-            else:
-                # Generic marker to indicate presence of an image
-                alt_texts.append("[image]")
+    # If element itself or any descendant is an <img>, prefer using its alt/title/src as the text.
+    try:
+        # fast path: element is an img
+        tag = getattr(element, "tag", "")
+        if isinstance(tag, str) and tag.split("}")[-1].lower() == "img":
+            alt = (element.get("alt") or element.get("title") or element.get("src") or "").strip()
+            return alt if alt else "[image]"
 
-    if alt_texts:
-        return " ".join(alt_texts)
-
+        # otherwise look for descendant imgs (prefer the first/closest)
+        imgs = element.xpath(".//img") if hasattr(element, "xpath") else []
+        if imgs:
+            first = imgs[0]
+            alt = (first.get("alt") or first.get("title") or first.get("src") or "").strip()
+            return alt if alt else "[image]"
+    except Exception:
+        # fall through to more thorough scanning below
+        pass
     return ""
 
 
@@ -355,24 +353,6 @@ def remove_non_content_blocks(tree, min_header_repeat: int = 3, min_package_grou
                 except Exception:
                     pass
                 continue
-                
-            tokens = [t for t in re.split(r'[\s,;]+', txt) if t]
-            if not tokens:
-                break
-
-            should_remove = all(_FILENAME_RE.match(tok) for tok in tokens)
-               
-            if should_remove:
-                try:
-                    parent = last.getparent()
-                    if parent is not None:
-                        logger.warn("Removing trailing element: %r", last)
-                        parent.remove(last)
-                        body_children.pop()
-                except Exception:
-                    pass
-                continue
-            break
 
         # 4) repeated header detection among top-level children
         top_children = list(body)
