@@ -145,11 +145,38 @@ def _extract_sentence_fragment(text: str, which: str = "last", max_len: int = 20
 
 
 def _get_text_content(element):
-    """Get text content from an lxml element, similar to BeautifulSoup's get_text()"""
+    """Get text content from an lxml element, similar to BeautifulSoup's get_text().
+    Treat elements containing images as having content (using img alt/title/src) so image-only blocks
+    are not considered empty and won't be removed by heuristics.
+    """
     if element is None:
         return ""
-    return "".join(element.itertext()).strip() or ""
-    # return (element.text_content() or "").strip()
+
+    # Prefer visible text nodes
+    text = "".join(element.itertext()).strip()
+    if text:
+        return text
+
+    # If no text, but contains <img> descendants, use their alt/title/src as content so
+    # image-only blocks are not considered empty and removed.
+    alt_texts = []
+    for node in element.iter():
+        tag = getattr(node, "tag", "")
+        if not isinstance(tag, str):
+            continue
+        local = tag.split("}")[-1].lower()
+        if local == "img":
+            alt = (node.get("alt") or node.get("title") or node.get("src") or "").strip()
+            if alt:
+                alt_texts.append(alt)
+            else:
+                # Generic marker to indicate presence of an image
+                alt_texts.append("[image]")
+
+    if alt_texts:
+        return " ".join(alt_texts)
+
+    return ""
 
 
 def _gather_text_from_previous(img_tag, max_ancestors: int = 4) -> str:
@@ -218,7 +245,8 @@ def _build_title_from_context(img_tag) -> str:
     else:
         title = ""
 
-    return title.strip()
+    # Normalize whitespace and remove newlines
+    return title.strip().replace("\n", " ")
 
 
 def inline_images_in_html(tree):
@@ -236,9 +264,7 @@ def inline_images_in_html(tree):
         alt_text = _build_title_from_context(img)
         if alt_text:
             img.set("alt", alt_text)
-        else:
-            img.set("alt", "")
-        
+
         # Remove title attribute if present
         if "title" in img.attrib:
             del img.attrib["title"]
@@ -289,6 +315,7 @@ def remove_non_content_blocks(tree, min_header_repeat: int = 3, min_package_grou
                 try:
                     parent = element.getparent()
                     if parent is not None:
+                        logger.warn("Removing package-entry element: %r", element)
                         parent.remove(element)
                 except Exception:
                     pass
@@ -306,6 +333,7 @@ def remove_non_content_blocks(tree, min_header_repeat: int = 3, min_package_grou
                         try:
                             parent = element.getparent()
                             if parent is not None:
+                                logger.warn("Removing package-entry element: %r", element)
                                 parent.remove(element)
                         except Exception:
                             pass
@@ -321,6 +349,7 @@ def remove_non_content_blocks(tree, min_header_repeat: int = 3, min_package_grou
                 try:
                     parent = last.getparent()
                     if parent is not None:
+                        logger.warn("Removing trailing element: %r", last)
                         parent.remove(last)
                         body_children.pop()
                 except Exception:
@@ -337,6 +366,7 @@ def remove_non_content_blocks(tree, min_header_repeat: int = 3, min_package_grou
                 try:
                     parent = last.getparent()
                     if parent is not None:
+                        logger.warn("Removing trailing element: %r", last)
                         parent.remove(last)
                         body_children.pop()
                 except Exception:
@@ -655,7 +685,6 @@ async def parse_file(file: UploadFile = File(...)):
         except Exception as e:
             logger.exception("failed to fetch rmeta from Tika")
             raise HTTPException(status_code=502, detail=f"tika /rmeta error: {e}")
-
         logger.debug("Fetched rmeta: main content length=%d, embedded records=%d", len(html) if html else 0, len(embedded_records) if embedded_records else 0)
         logger.debug("Fetching rmeta took %.3f seconds", asyncio.get_event_loop().time() - start_time)
 
