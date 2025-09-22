@@ -3,3 +3,4 @@ uvicorn[standard]
 httpx
 beautifulsoup4
 markdownify
+lxml
