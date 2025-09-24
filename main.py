@@ -419,8 +419,18 @@ def _build_title_from_context(img_tag) -> str:
     else:
         title = ""
 
-    # Normalize whitespace and remove newlines
-    return title.strip().replace("\n", " ")
+    # Normalize whitespace, remove newlines and strip markdown-sensitive/control characters
+    clean = title.strip()
+    # replace newlines and carriage returns with spaces
+    clean = re.sub(r'[\r\n]+', ' ', clean)
+    # remove characters that commonly break Markdown image/link syntax or can produce unexpected formatting
+    # (square/bracket, parentheses, angle brackets, backticks, asterisks, underscores, tildes, exclamation)
+    clean = re.sub(r'[\[\]\(\)<>`*_~!]', ' ', clean)
+    # remove other control characters
+    clean = re.sub(r'[\x00-\x1F\x7F]', '', clean)
+    # collapse multiple whitespace to single space and trim
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean
 
 
 def inline_images_in_html(tree, attachments: Dict[str, bytes]):
