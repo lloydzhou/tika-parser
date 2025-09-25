@@ -410,15 +410,7 @@ def _build_title_from_context(img_tag) -> str:
     prev_frag = _extract_sentence_fragment(prev_text, which="last", max_len=120) if prev_text else ""
     next_frag = _extract_sentence_fragment(next_text, which="first", max_len=120) if next_text else ""
 
-    if prev_frag and next_frag:
-        title = f"{prev_frag} {next_frag}"
-    elif prev_frag:
-        title = prev_frag
-    elif next_frag:
-        title = next_frag
-    else:
-        title = ""
-
+    title = f"上文：{prev_frag or ''};下文：{next_frag or ''}"
     # Normalize whitespace, remove newlines and strip markdown-sensitive/control characters
     clean = title.strip()
     # replace newlines and carriage returns with spaces
