@@ -452,8 +452,12 @@ def inline_images_in_html(tree, attachments: Dict[str, bytes]):
             img_name = img_name.split(":", 1).pop()
         if img_name and img_name in attachments:
             img_data = attachments[img_name]
-            img.set("src", f"data:image/png;base64,{base64.b64encode(img_data).decode()}")
-    
+            try:
+                img_type = imghdr.what(None, h=img_data)
+            except Exception:
+                img_type = 'png'  # fallback
+            img.set("src", f"data:image/{img_type};base64,{base64.b64encode(img_data).decode()}")
+
     return tree
 
 
